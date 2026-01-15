@@ -2,25 +2,10 @@
 //!
 //! A high-performance, production-ready arbitrage trading system for cross-platform
 //! prediction markets. This system monitors price discrepancies between Kalshi and
-//! Polymarket, executing risk-free arbitrage opportunities in real-time.
+//! Polymarket
 //!
-//! ## Strategy
-//!
-//! The core arbitrage strategy exploits the fundamental property of prediction markets:
-//! YES + NO = $1.00 (guaranteed). Arbitrage opportunities exist when:
-//!
-//! ```
-//! Best YES ask (Platform A) + Best NO ask (Platform B) < $1.00
-//! ```
-//!
-//! ## Architecture
-//!
-//! - **Real-time price monitoring** via WebSocket connections to both platforms
-//! - **Lock-free orderbook cache** using atomic operations for zero-copy updates
-//! - **SIMD-accelerated arbitrage detection** for sub-millisecond latency
-//! - **Concurrent order execution** with automatic position reconciliation
-//! - **Circuit breaker protection** with configurable risk limits
-//! - **Market discovery system** with intelligent caching and incremental updates
+//! NOTE: This file includes a KALSHI_ONLY mode that disables all Polymarket logic
+//! so the app can run in Kalshi-only environments.
 
 mod cache;
 mod circuit_breaker;
@@ -42,16 +27,20 @@ use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
 use discovery::DiscoveryClient;
-use execution::{ExecutionEngine, create_execution_channel, run_execution_loop};
-use kalshi::{KalshiConfig, KalshiApiClient};
+use execution::{create_execution_channel, run_execution_loop, ExecutionEngine};
+use kalshi::{KalshiApiClient, KalshiConfig};
 use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
-use position_tracker::{PositionTracker, create_position_channel, position_writer_loop};
+use position_tracker::{create_position_channel, position_writer_loop, PositionTracker};
 use types::{GlobalState, PriceCents};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
+
+let kalshi_only = std::env::var("KALSHI_ONLY")
+    .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+    .unwrap_or(false);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,48 +53,39 @@ async fn main() -> Result<()> {
         .init();
 
     info!("🚀 Prediction Market Arbitrage System v2.0");
-    info!("   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
-          ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
+    info!(
+        "   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
+        ARB_THRESHOLD * 100.0,
+        (1.0 - ARB_THRESHOLD) * 100.0
+    );
     info!("   Monitored leagues: {:?}", ENABLED_LEAGUES);
 
+    // Load .env early
+    dotenvy::dotenv().ok();
+
     // Check for dry run mode
-    let dry_run = std::env::var("DRY_RUN").map(|v| v == "1" || v == "true").unwrap_or(true);
+    let dry_run = std::env::var("DRY_RUN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+
     if dry_run {
         info!("   Mode: DRY RUN (set DRY_RUN=0 to execute)");
     } else {
         warn!("   Mode: LIVE EXECUTION");
     }
 
+    // Kalshi-only mode toggle
+    let kalshi_only = std::env::var("KALSHI_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if kalshi_only {
+        warn!("   Mode: KALSHI ONLY (Polymarket disabled)");
+    }
+
     // Load Kalshi credentials
     let kalshi_config = KalshiConfig::from_env()?;
     info!("[KALSHI] API key loaded");
-
-    // Load Polymarket credentials
-    dotenvy::dotenv().ok();
-    let poly_private_key = std::env::var("POLY_PRIVATE_KEY")
-        .context("POLY_PRIVATE_KEY not set")?;
-    let poly_funder = std::env::var("POLY_FUNDER")
-        .context("POLY_FUNDER not set (your wallet address)")?;
-
-    // Create async Polymarket client and derive API credentials
-    info!("[POLYMARKET] Creating async client and deriving API credentials...");
-    let poly_async_client = PolymarketAsyncClient::new(
-        POLY_CLOB_HOST,
-        POLYGON_CHAIN_ID,
-        &poly_private_key,
-        &poly_funder,
-    )?;
-    let api_creds = poly_async_client.derive_api_key(0).await?;
-    let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
-    let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
-
-    // Load neg_risk cache from Python script output
-    match poly_async.load_cache(".clob_market_cache.json") {
-        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
-        Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
-    }
-
-    info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
 
     // Load team code mapping cache
     let team_cache = TeamCache::load();
@@ -116,15 +96,17 @@ async fn main() -> Result<()> {
 
     // Run discovery (with caching support)
     let force_discovery = std::env::var("FORCE_DISCOVERY")
-        .map(|v| v == "1" || v == "true")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    info!("🔍 Market discovery{}...",
-          if force_discovery { " (forced refresh)" } else { "" });
+    info!(
+        "🔍 Market discovery{}...",
+        if force_discovery { " (forced refresh)" } else { "" }
+    );
 
     let discovery = DiscoveryClient::new(
         KalshiApiClient::new(KalshiConfig::from_env()?),
-        team_cache
+        team_cache,
     );
 
     let result = if force_discovery {
@@ -150,10 +132,10 @@ async fn main() -> Result<()> {
     // Display discovered market pairs
     info!("📋 Discovered market pairs:");
     for pair in &result.pairs {
-        info!("   ✅ {} | {} | Kalshi: {}",
-              pair.description,
-              pair.market_type,
-              pair.kalshi_market_ticker);
+        info!(
+            "   ✅ {} | {} | Kalshi: {}",
+            pair.description, pair.market_type, pair.kalshi_market_ticker
+        );
     }
 
     // Build global state
@@ -162,21 +144,146 @@ async fn main() -> Result<()> {
         for pair in result.pairs {
             s.add_pair(pair);
         }
-        info!("📡 Global state initialized: tracking {} markets", s.market_count());
+        info!(
+            "📡 Global state initialized: tracking {} markets",
+            s.market_count()
+        );
         s
     });
 
-    // Initialize execution infrastructure
+    // Threshold
+    let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
+    info!("   Execution threshold: {} cents", threshold_cents);
+
+    // Create execution channel (Kalshi WS expects a sender)
     let (exec_tx, exec_rx) = create_execution_channel();
+
+    // Prepare Kalshi WS config reused on reconnects
+    let kalshi_ws_config = KalshiConfig::from_env()?;
+
+    // ============================
+    // KALSHI-ONLY MODE (RETURN EARLY)
+    // ============================
+    if kalshi_only {
+        // Drain exec_rx so Kalshi WS never blocks sending
+        tokio::spawn(async move {
+            let mut rx = exec_rx;
+            while rx.recv().await.is_some() {
+                // discard
+            }
+        });
+
+        // Start Kalshi WebSocket connection
+        let kalshi_state = state.clone();
+        let kalshi_exec_tx = exec_tx.clone();
+        let kalshi_threshold = threshold_cents;
+
+        let kalshi_handle = tokio::spawn(async move {
+            loop {
+                if let Err(e) = kalshi::run_ws(
+                    &kalshi_ws_config,
+                    kalshi_state.clone(),
+                    kalshi_exec_tx.clone(),
+                    kalshi_threshold,
+                )
+                .await
+                {
+                    error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+            }
+        });
+
+        // Simple Kalshi-only heartbeat
+        let heartbeat_state = state.clone();
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+
+                let market_count = heartbeat_state.market_count();
+                let mut with_kalshi_any = 0;
+                let mut with_kalshi_both = 0;
+
+                for market in heartbeat_state.markets.iter().take(market_count) {
+                    let (k_yes, k_no, _, _) = market.kalshi.load();
+                    if k_yes > 0 || k_no > 0 {
+                        with_kalshi_any += 1;
+                    }
+                    if k_yes > 0 && k_no > 0 {
+                        with_kalshi_both += 1;
+                    }
+                }
+
+                info!(
+                    "💓 Kalshi-only heartbeat | Markets: {} total, {} with any Kalshi prices, {} with BOTH (yes/no)",
+                    market_count, with_kalshi_any, with_kalshi_both
+                );
+            }
+        });
+
+        info!("✅ Kalshi-only mode active - running Kalshi WS + heartbeat");
+        let _ = tokio::join!(kalshi_handle, heartbeat_handle);
+        return Ok(());
+    }
+
+    // ============================
+    // FULL MODE (Kalshi + Polymarket)
+    // ============================
+
+    // Load Polymarket credentials
+    let poly_private_key =
+        std::env::var("POLY_PRIVATE_KEY").context("POLY_PRIVATE_KEY not set")?;
+    let poly_funder = std::env::var("POLY_FUNDER")
+        .context("POLY_FUNDER not set (your wallet address)")?;
+
+    // Create async Polymarket client and derive API credentials
+    info!("[POLYMARKET] Creating async client and deriving API credentials...");
+    let poly_async_client = PolymarketAsyncClient::new(
+        POLY_CLOB_HOST,
+        POLYGON_CHAIN_ID,
+        &poly_private_key,
+        &poly_funder,
+    )?;
+    let api_creds = poly_async_client.derive_api_key(0).await?;
+    let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
+    let poly_async =
+        Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
+
+    // Load neg_risk cache from Python script output
+    match poly_async.load_cache(".clob_market_cache.json") {
+        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
+        Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
+    }
+
+    info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
+
+    // Start Kalshi WebSocket connection (full mode)
+    let kalshi_state = state.clone();
+    let kalshi_exec_tx = exec_tx.clone();
+    let kalshi_threshold = threshold_cents;
+    let kalshi_handle = tokio::spawn(async move {
+        loop {
+            if let Err(e) = kalshi::run_ws(
+                &kalshi_ws_config,
+                kalshi_state.clone(),
+                kalshi_exec_tx.clone(),
+                kalshi_threshold,
+            )
+            .await
+            {
+                error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+        }
+    });
+
+    // Initialize execution infrastructure
     let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::from_env()));
 
     let position_tracker = Arc::new(RwLock::new(PositionTracker::new()));
     let (position_channel, position_rx) = create_position_channel();
-
     tokio::spawn(position_writer_loop(position_rx, position_tracker));
-
-    let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
-    info!("   Execution threshold: {} cents", threshold_cents);
 
     let engine = Arc::new(ExecutionEngine::new(
         kalshi_api.clone(),
@@ -188,90 +295,6 @@ async fn main() -> Result<()> {
     ));
 
     let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine));
-
-    // === TEST MODE: Synthetic arbitrage injection ===
-    // TEST_ARB=1 to enable, TEST_ARB_TYPE=poly_yes_kalshi_no|kalshi_yes_poly_no|poly_only|kalshi_only
-    let test_arb = std::env::var("TEST_ARB").map(|v| v == "1" || v == "true").unwrap_or(false);
-    if test_arb {
-        let test_state = state.clone();
-        let test_exec_tx = exec_tx.clone();
-        let test_dry_run = dry_run;
-
-        // Parse arb type from environment (default: poly_yes_kalshi_no)
-        let arb_type_str = std::env::var("TEST_ARB_TYPE").unwrap_or_else(|_| "poly_yes_kalshi_no".to_string());
-
-        tokio::spawn(async move {
-            use types::{FastExecutionRequest, ArbType};
-
-            // Wait for WebSocket connections to establish and populate orderbooks
-            info!("[TEST] Injecting synthetic arbitrage opportunity in 10 seconds...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-            // Parse arb type
-            let arb_type = match arb_type_str.to_lowercase().as_str() {
-                "poly_yes_kalshi_no" | "pykn" | "0" => ArbType::PolyYesKalshiNo,
-                "kalshi_yes_poly_no" | "kypn" | "1" => ArbType::KalshiYesPolyNo,
-                "poly_only" | "poly" | "2" => ArbType::PolyOnly,
-                "kalshi_only" | "kalshi" | "3" => ArbType::KalshiOnly,
-                _ => {
-                    warn!("[TEST] Unknown TEST_ARB_TYPE='{}', defaulting to PolyYesKalshiNo", arb_type_str);
-                    warn!("[TEST] Valid values: poly_yes_kalshi_no, kalshi_yes_poly_no, poly_only, kalshi_only");
-                    ArbType::PolyYesKalshiNo
-                }
-            };
-
-            // Set prices based on arb type for realistic test scenarios
-            let (yes_price, no_price, description) = match arb_type {
-                ArbType::PolyYesKalshiNo => (40, 50, "P_yes=40¢ + K_no=50¢ + fee≈2¢ = 92¢ → 8¢ profit"),
-                ArbType::KalshiYesPolyNo => (40, 50, "K_yes=40¢ + P_no=50¢ + fee≈2¢ = 92¢ → 8¢ profit"),
-                ArbType::PolyOnly => (48, 50, "P_yes=48¢ + P_no=50¢ + fee=0¢ = 98¢ → 2¢ profit (NO FEES!)"),
-                ArbType::KalshiOnly => (44, 44, "K_yes=44¢ + K_no=44¢ + fee≈4¢ = 92¢ → 8¢ profit (DOUBLE FEES)"),
-            };
-
-            // Find first market with valid state
-            let market_count = test_state.market_count();
-            for market_id in 0..market_count {
-                if let Some(market) = test_state.get_by_id(market_id as u16) {
-                    if let Some(pair) = &market.pair {
-                        // SIZE: 1000 cents = 10 contracts (Poly $1 min requires ~3 contracts at 40¢)
-                        let fake_req = FastExecutionRequest {
-                            market_id: market_id as u16,
-                            yes_price,
-                            no_price,
-                            yes_size: 1000,  // 1000¢ = 10 contracts
-                            no_size: 1000,   // 1000¢ = 10 contracts
-                            arb_type,
-                            detected_ns: 0,
-                        };
-
-                        warn!("[TEST] 🧪 Injecting synthetic {:?} arbitrage for: {}", arb_type, pair.description);
-                        warn!("[TEST]    Scenario: {}", description);
-                        warn!("[TEST]    Position size capped to 10 contracts for safety");
-                        warn!("[TEST]    Execution mode: DRY_RUN={}", test_dry_run);
-
-                        if let Err(e) = test_exec_tx.send(fake_req).await {
-                            error!("[TEST] Failed to send fake arb: {}", e);
-                        }
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    // Initialize Kalshi WebSocket connection (config reused on reconnects)
-    let kalshi_state = state.clone();
-    let kalshi_exec_tx = exec_tx.clone();
-    let kalshi_threshold = threshold_cents;
-    let kalshi_ws_config = KalshiConfig::from_env()?;
-    let kalshi_handle = tokio::spawn(async move {
-        loop {
-            if let Err(e) = kalshi::run_ws(&kalshi_ws_config, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold).await {
-                error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
-        }
-    });
 
     // Initialize Polymarket WebSocket connection
     let poly_state = state.clone();
@@ -298,7 +321,6 @@ async fn main() -> Result<()> {
             let mut with_kalshi = 0;
             let mut with_poly = 0;
             let mut with_both = 0;
-            // Track best arbitrage opportunity: (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
             let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
@@ -306,8 +328,12 @@ async fn main() -> Result<()> {
                 let (p_yes, p_no, _, _) = market.poly.load();
                 let has_k = k_yes > 0 && k_no > 0;
                 let has_p = p_yes > 0 && p_no > 0;
-                if k_yes > 0 || k_no > 0 { with_kalshi += 1; }
-                if p_yes > 0 || p_no > 0 { with_poly += 1; }
+                if k_yes > 0 || k_no > 0 {
+                    with_kalshi += 1;
+                }
+                if p_yes > 0 || p_no > 0 {
+                    with_poly += 1;
+                }
                 if has_k && has_p {
                     with_both += 1;
 
@@ -329,12 +355,15 @@ async fn main() -> Result<()> {
                 }
             }
 
-            info!("💓 System heartbeat | Markets: {} total, {} with Kalshi prices, {} with Polymarket prices, {} with both | threshold={}¢",
-                  market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
+            info!(
+                "💓 System heartbeat | Markets: {} total, {} with Kalshi prices, {} with Polymarket prices, {} with both | threshold={}¢",
+                market_count, with_kalshi, with_poly, with_both, heartbeat_threshold
+            );
 
             if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
-                let desc = heartbeat_state.get_by_id(market_id)
+                let desc = heartbeat_state
+                    .get_by_id(market_id)
                     .and_then(|m| m.pair.as_ref())
                     .map(|p| &*p.description)
                     .unwrap_or("Unknown");
@@ -344,11 +373,15 @@ async fn main() -> Result<()> {
                     format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
                 };
                 if gap <= 10 {
-                    info!("   📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
-                          desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
+                    info!(
+                        "   📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                        desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no
+                    );
                 } else {
-                    info!("   📊 Best opportunity: {} | {} | gap={:+}¢ (market efficient)",
-                          desc, leg_breakdown, gap);
+                    info!(
+                        "   📊 Best opportunity: {} | {} | gap={:+}¢ (market efficient)",
+                        desc, leg_breakdown, gap
+                    );
                 }
             } else if with_both == 0 {
                 warn!("   ⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections");
@@ -362,3 +395,4 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+

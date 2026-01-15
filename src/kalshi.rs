@@ -438,7 +438,7 @@ pub async fn run_ws(
         .as_millis()
         .to_string();
 
-    let signature = config.sign(&format!("{}GET/trade-api/ws/v2", timestamp))?;
+    let signature = config.sign(&format!("{}GET/", timestamp))?;
 
     let request = Request::builder()
         .uri(KALSHI_WS_URL)
@@ -669,3 +669,4 @@ async fn send_kalshi_arb_request(
 
     let _ = exec_tx.try_send(req);
 }
+

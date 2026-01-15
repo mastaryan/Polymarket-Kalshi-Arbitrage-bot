@@ -4,7 +4,7 @@
 //! environment variable parsing for the trading system.
 
 /// Kalshi WebSocket URL
-pub const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
+pub const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com";
 
 /// Kalshi REST API base URL
 pub const KALSHI_API_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
@@ -180,3 +180,4 @@ pub fn get_league_config(league: &str) -> Option<LeagueConfig> {
         .into_iter()
         .find(|c| c.league_code == league || c.poly_prefix == league)
 }
+

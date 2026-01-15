@@ -671,3 +671,4 @@ mod tests {
         assert_eq!(kalshi_date_to_iso("25JAN01"), "2025-01-01");
     }
 }
+
