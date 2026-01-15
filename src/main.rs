@@ -38,10 +38,6 @@ const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
 
-let kalshi_only = std::env::var("KALSHI_ONLY")
-    .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
-    .unwrap_or(false);
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -109,7 +105,9 @@ async fn main() -> Result<()> {
         team_cache,
     );
 
-    let result = if force_discovery {
+    let result = if kalshi_only {
+        discovery.discover_kalshi_only(ENABLED_LEAGUES).await
+    } else if force_discovery {
         discovery.discover_all_force(ENABLED_LEAGUES).await
     } else {
         discovery.discover_all(ENABLED_LEAGUES).await
@@ -165,13 +163,23 @@ async fn main() -> Result<()> {
     // KALSHI-ONLY MODE (RETURN EARLY)
     // ============================
     if kalshi_only {
-        // Drain exec_rx so Kalshi WS never blocks sending
-        tokio::spawn(async move {
-            let mut rx = exec_rx;
-            while rx.recv().await.is_some() {
-                // discard
-            }
-        });
+        // Initialize execution infrastructure (Kalshi-only)
+        let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::from_env()));
+
+        let position_tracker = Arc::new(RwLock::new(PositionTracker::new()));
+        let (position_channel, position_rx) = create_position_channel();
+        tokio::spawn(position_writer_loop(position_rx, position_tracker));
+
+        let engine = Arc::new(ExecutionEngine::new(
+            kalshi_api.clone(),
+            None,
+            state.clone(),
+            circuit_breaker.clone(),
+            position_channel,
+            dry_run,
+        ));
+
+        let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine));
 
         // Start Kalshi WebSocket connection
         let kalshi_state = state.clone();
@@ -194,9 +202,10 @@ async fn main() -> Result<()> {
             }
         });
 
-        // Simple Kalshi-only heartbeat
+        // Kalshi-only heartbeat + opportunity scan
         let heartbeat_state = state.clone();
         let heartbeat_handle = tokio::spawn(async move {
+            use crate::types::kalshi_fee_cents;
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
@@ -204,6 +213,7 @@ async fn main() -> Result<()> {
                 let market_count = heartbeat_state.market_count();
                 let mut with_kalshi_any = 0;
                 let mut with_kalshi_both = 0;
+                let mut best_arb: Option<(u16, u16, u16, u16, i16)> = None;
 
                 for market in heartbeat_state.markets.iter().take(market_count) {
                     let (k_yes, k_no, _, _) = market.kalshi.load();
@@ -212,6 +222,12 @@ async fn main() -> Result<()> {
                     }
                     if k_yes > 0 && k_no > 0 {
                         with_kalshi_both += 1;
+                        let fee = kalshi_fee_cents(k_yes) + kalshi_fee_cents(k_no);
+                        let cost = k_yes + k_no + fee;
+                        if best_arb.is_none() || cost < best_arb.as_ref().unwrap().0 {
+                            let profit = 100i16 - cost as i16;
+                            best_arb = Some((cost, market.market_id, k_yes, k_no, fee as u16, profit));
+                        }
                     }
                 }
 
@@ -219,11 +235,32 @@ async fn main() -> Result<()> {
                     "💓 Kalshi-only heartbeat | Markets: {} total, {} with any Kalshi prices, {} with BOTH (yes/no)",
                     market_count, with_kalshi_any, with_kalshi_both
                 );
+
+                if let Some((cost, market_id, k_yes, k_no, fee, profit)) = best_arb {
+                    let desc = heartbeat_state
+                        .get_by_id(market_id)
+                        .and_then(|m| m.pair.as_ref())
+                        .map(|p| &*p.description)
+                        .unwrap_or("Unknown");
+                    let gap = cost as i16 - threshold_cents as i16;
+                    let breakdown = format!("K_yes({}›) + K_no({}›) + K_fee({}›) = {}›", k_yes, k_no, fee, cost);
+                    if gap <= 10 {
+                        info!(
+                            "   ?? Best Kalshi arb: {} | {} | gap={:+}› | profit={}›/contract",
+                            desc, breakdown, gap, profit
+                        );
+                    } else {
+                        info!(
+                            "   ?? Best Kalshi arb: {} | {} | gap={:+}› (market efficient)",
+                            desc, breakdown, gap
+                        );
+                    }
+                }
             }
         });
 
-        info!("✅ Kalshi-only mode active - running Kalshi WS + heartbeat");
-        let _ = tokio::join!(kalshi_handle, heartbeat_handle);
+        info!("✅ Kalshi-only mode active - running Kalshi WS + execution + heartbeat");
+        let _ = tokio::join!(kalshi_handle, heartbeat_handle, exec_handle);
         return Ok(());
     }
 
@@ -287,7 +324,7 @@ async fn main() -> Result<()> {
 
     let engine = Arc::new(ExecutionEngine::new(
         kalshi_api.clone(),
-        poly_async,
+        Some(poly_async),
         state.clone(),
         circuit_breaker.clone(),
         position_channel,

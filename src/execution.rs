@@ -49,7 +49,7 @@ impl Default for NanoClock {
 /// Core execution engine for processing arbitrage opportunities
 pub struct ExecutionEngine {
     kalshi: Arc<KalshiApiClient>,
-    poly_async: Arc<SharedAsyncClient>,
+    poly_async: Option<Arc<SharedAsyncClient>>,
     state: Arc<GlobalState>,
     circuit_breaker: Arc<CircuitBreaker>,
     position_channel: PositionChannel,
@@ -62,7 +62,7 @@ pub struct ExecutionEngine {
 impl ExecutionEngine {
     pub fn new(
         kalshi: Arc<KalshiApiClient>,
-        poly_async: Arc<SharedAsyncClient>,
+        poly_async: Option<Arc<SharedAsyncClient>>,
         state: Arc<GlobalState>,
         circuit_breaker: Arc<CircuitBreaker>,
         position_channel: PositionChannel,
@@ -295,13 +295,15 @@ impl ExecutionEngine {
         match req.arb_type {
             // === CROSS-PLATFORM: Poly YES + Kalshi NO ===
             ArbType::PolyYesKalshiNo => {
+                let poly_async = self.poly_async.as_ref()
+                    .ok_or_else(|| anyhow!("Polymarket client not configured"))?;
                 let kalshi_fut = self.kalshi.buy_ioc(
                     &pair.kalshi_market_ticker,
                     "no",
                     req.no_price as i64,
                     contracts,
                 );
-                let poly_fut = self.poly_async.buy_fak(
+                let poly_fut = poly_async.buy_fak(
                     &pair.poly_yes_token,
                     cents_to_price(req.yes_price),
                     contracts as f64,
@@ -312,13 +314,15 @@ impl ExecutionEngine {
 
             // === CROSS-PLATFORM: Kalshi YES + Poly NO ===
             ArbType::KalshiYesPolyNo => {
+                let poly_async = self.poly_async.as_ref()
+                    .ok_or_else(|| anyhow!("Polymarket client not configured"))?;
                 let kalshi_fut = self.kalshi.buy_ioc(
                     &pair.kalshi_market_ticker,
                     "yes",
                     req.yes_price as i64,
                     contracts,
                 );
-                let poly_fut = self.poly_async.buy_fak(
+                let poly_fut = poly_async.buy_fak(
                     &pair.poly_no_token,
                     cents_to_price(req.no_price),
                     contracts as f64,
@@ -329,12 +333,14 @@ impl ExecutionEngine {
 
             // === SAME-PLATFORM: Poly YES + Poly NO ===
             ArbType::PolyOnly => {
-                let yes_fut = self.poly_async.buy_fak(
+                let poly_async = self.poly_async.as_ref()
+                    .ok_or_else(|| anyhow!("Polymarket client not configured"))?;
+                let yes_fut = poly_async.buy_fak(
                     &pair.poly_yes_token,
                     cents_to_price(req.yes_price),
                     contracts as f64,
                 );
-                let no_fut = self.poly_async.buy_fak(
+                let no_fut = poly_async.buy_fak(
                     &pair.poly_no_token,
                     cents_to_price(req.no_price),
                     contracts as f64,
@@ -462,7 +468,7 @@ impl ExecutionEngine {
     /// Background task to automatically close excess exposure from mismatched fills
     async fn auto_close_background(
         kalshi: Arc<KalshiApiClient>,
-        poly_async: Arc<SharedAsyncClient>,
+        poly_async: Option<Arc<SharedAsyncClient>>,
         arb_type: ArbType,
         yes_filled: i64,
         no_filled: i64,
@@ -491,6 +497,10 @@ impl ExecutionEngine {
 
         match arb_type {
             ArbType::PolyOnly => {
+                let Some(poly_async) = poly_async else {
+                    warn!("[EXEC] ?? Poly client missing - skipping auto-close");
+                    return;
+                };
                 let (token, side, price) = if yes_filled > no_filled {
                     (&poly_yes_token, "yes", yes_price)
                 } else {
@@ -526,6 +536,10 @@ impl ExecutionEngine {
 
             ArbType::PolyYesKalshiNo => {
                 if yes_filled > no_filled {
+                    let Some(poly_async) = poly_async.clone() else {
+                        warn!("[EXEC] ?? Poly client missing - skipping auto-close");
+                        return;
+                    };
                     // Poly YES excess
                     let close_price = cents_to_price((yes_price as i16).saturating_sub(10).max(1) as u16);
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} yes contracts)", excess);
@@ -560,6 +574,10 @@ impl ExecutionEngine {
                         Err(e) => warn!("[EXEC] ⚠️ Failed to close Kalshi excess: {}", e),
                     }
                 } else {
+                    let Some(poly_async) = poly_async.clone() else {
+                        warn!("[EXEC] ?? Poly client missing - skipping auto-close");
+                        return;
+                    };
                     // Poly NO excess
                     let close_price = cents_to_price((no_price as i16).saturating_sub(10).max(1) as u16);
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} no contracts)", excess);

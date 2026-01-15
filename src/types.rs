@@ -179,18 +179,19 @@ impl AtomicMarketState {
         let (k_yes, k_no, _, _) = self.kalshi.load();
         let (p_yes, p_no, _, _) = self.poly.load();
 
-        if k_yes == NO_PRICE || k_no == NO_PRICE || p_yes == NO_PRICE || p_no == NO_PRICE {
-            return 0;
-        }
+        let k_yes_ok = k_yes != NO_PRICE;
+        let k_no_ok = k_no != NO_PRICE;
+        let p_yes_ok = p_yes != NO_PRICE;
+        let p_no_ok = p_no != NO_PRICE;
 
         let k_yes_fee = KALSHI_FEE_TABLE[k_yes as usize];
         let k_no_fee = KALSHI_FEE_TABLE[k_no as usize];
 
         let costs = i16x8::new([
-            (p_yes + k_no + k_no_fee) as i16,
-            (k_yes + k_yes_fee + p_no) as i16,
-            (p_yes + p_no) as i16,
-            (k_yes + k_yes_fee + k_no + k_no_fee) as i16,
+            if p_yes_ok && k_no_ok { (p_yes + k_no + k_no_fee) as i16 } else { i16::MAX },
+            if k_yes_ok && p_no_ok { (k_yes + k_yes_fee + p_no) as i16 } else { i16::MAX },
+            if p_yes_ok && p_no_ok { (p_yes + p_no) as i16 } else { i16::MAX },
+            if k_yes_ok && k_no_ok { (k_yes + k_yes_fee + k_no + k_no_fee) as i16 } else { i16::MAX },
             i16::MAX, i16::MAX, i16::MAX, i16::MAX,
         ]);
 
@@ -365,13 +366,17 @@ impl GlobalState {
 
         // Pre-compute hashes
         let kalshi_hash = fxhash_str(&pair.kalshi_market_ticker);
-        let poly_yes_hash = fxhash_str(&pair.poly_yes_token);
-        let poly_no_hash = fxhash_str(&pair.poly_no_token);
 
         // Update lookup maps
         self.kalshi_to_id.insert(kalshi_hash, market_id);
-        self.poly_yes_to_id.insert(poly_yes_hash, market_id);
-        self.poly_no_to_id.insert(poly_no_hash, market_id);
+        if !pair.poly_yes_token.is_empty() {
+            let poly_yes_hash = fxhash_str(&pair.poly_yes_token);
+            self.poly_yes_to_id.insert(poly_yes_hash, market_id);
+        }
+        if !pair.poly_no_token.is_empty() {
+            let poly_no_hash = fxhash_str(&pair.poly_no_token);
+            self.poly_no_to_id.insert(poly_no_hash, market_id);
+        }
 
         // Store pair
         self.markets[market_id as usize].pair = Some(Arc::new(pair));

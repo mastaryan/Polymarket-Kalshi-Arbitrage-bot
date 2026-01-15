@@ -200,6 +200,38 @@ impl DiscoveryClient {
         result
     }
 
+    /// Kalshi-only discovery (no Polymarket/Gamma lookups)
+    pub async fn discover_kalshi_only(&self, leagues: &[&str]) -> DiscoveryResult {
+        let configs: Vec<_> = if leagues.is_empty() {
+            get_league_configs()
+        } else {
+            leagues.iter()
+                .filter_map(|l| get_league_config(l))
+                .collect()
+        };
+
+        let league_futures: Vec<_> = configs.iter()
+            .map(|config| self.discover_league_kalshi_only(config))
+            .collect();
+
+        let league_results = futures_util::future::join_all(league_futures).await;
+
+        let mut result = DiscoveryResult::default();
+        for league_result in league_results {
+            match league_result {
+                Ok(pairs) => {
+                    result.kalshi_events_found += pairs.len();
+                    result.pairs.extend(pairs);
+                }
+                Err(e) => {
+                    result.errors.push(e.to_string());
+                }
+            }
+        }
+
+        result
+    }
+
     /// Full discovery without cache
     async fn discover_full(&self, leagues: &[&str]) -> DiscoveryResult {
         let configs: Vec<_> = if leagues.is_empty() {
@@ -227,6 +259,103 @@ impl DiscoveryClient {
         result.kalshi_events_found = result.pairs.len();
 
         result
+    }
+
+    /// Discover Kalshi markets for a single league (no Gamma)
+    async fn discover_league_kalshi_only(&self, config: &LeagueConfig) -> Result<Vec<MarketPair>> {
+        info!("?? Discovering {} markets (Kalshi-only)...", config.league_code);
+
+        let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let type_futures: Vec<_> = market_types.iter()
+            .filter_map(|market_type| {
+                let series = self.get_series_for_type(config, *market_type)?;
+                Some(self.discover_series_kalshi_only(config, series, *market_type))
+            })
+            .collect();
+
+        let type_results = futures_util::future::join_all(type_futures).await;
+
+        let mut pairs = Vec::new();
+        for (pairs_result, market_type) in type_results.into_iter().zip(market_types.iter()) {
+            match pairs_result {
+                Ok(mut series_pairs) => {
+                    let count = series_pairs.len();
+                    if count > 0 {
+                        info!("  ? {} {}: {} markets", config.league_code, market_type, count);
+                    }
+                    pairs.append(&mut series_pairs);
+                }
+                Err(e) => {
+                    warn!("{} {}: {}", config.league_code, market_type, e);
+                }
+            }
+        }
+
+        Ok(pairs)
+    }
+
+    /// Discover Kalshi markets for a specific series (no Gamma)
+    async fn discover_series_kalshi_only(
+        &self,
+        config: &LeagueConfig,
+        series: &str,
+        market_type: MarketType,
+    ) -> Result<Vec<MarketPair>> {
+        {
+            let _permit = self.kalshi_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
+            self.kalshi_limiter.until_ready().await;
+        }
+        let events = self.kalshi.get_events(series, 50).await?;
+
+        let kalshi = self.kalshi.clone();
+        let limiter = self.kalshi_limiter.clone();
+        let semaphore = self.kalshi_semaphore.clone();
+
+        let market_results: Vec<_> = stream::iter(events)
+            .map(|event| {
+                let kalshi = kalshi.clone();
+                let limiter = limiter.clone();
+                let semaphore = semaphore.clone();
+                let event_ticker = event.event_ticker.clone();
+                async move {
+                    let _permit = semaphore.acquire().await.ok();
+                    limiter.until_ready().await;
+                    let markets_result = kalshi.get_markets(&event_ticker).await;
+                    (event, markets_result)
+                }
+            })
+            .buffer_unordered(KALSHI_GLOBAL_CONCURRENCY * 2)
+            .collect()
+            .await;
+
+        let mut pairs = Vec::new();
+        for (event, markets_result) in market_results {
+            match markets_result {
+                Ok(markets) => {
+                    for market in markets {
+                        let team_suffix = extract_team_suffix(&market.ticker);
+                        pairs.push(MarketPair {
+                            pair_id: format!("kalshi-only-{}", market.ticker).into(),
+                            league: config.league_code.into(),
+                            market_type,
+                            description: format!("{} - {}", event.title, market.title).into(),
+                            kalshi_event_ticker: event.event_ticker.clone().into(),
+                            kalshi_market_ticker: market.ticker.into(),
+                            poly_slug: "".into(),
+                            poly_yes_token: "".into(),
+                            poly_no_token: "".into(),
+                            line_value: market.floor_strike,
+                            team_suffix: team_suffix.map(|s| s.into()),
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!("  ?? Failed to get markets for {}: {}", event.event_ticker, e);
+                }
+            }
+        }
+
+        Ok(pairs)
     }
 
     /// Incremental discovery - merge cached pairs with newly discovered ones
